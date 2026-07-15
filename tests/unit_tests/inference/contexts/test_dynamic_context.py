@@ -78,6 +78,7 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        hybrid_layer_pattern: str = None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -94,13 +95,15 @@ class TestDynamicContext:
         else:
             mamba_inference_state_config = None
 
+        model_config = TransformerConfig(
+            params_dtype=params_dtype,
+            num_layers=num_layers,
+            kv_channels=kv_channels,
+            num_attention_heads=num_attention_heads,
+        )
+        model_config.hybrid_layer_pattern = hybrid_layer_pattern
         dynamic_context = DynamicInferenceContext(
-            model_config=TransformerConfig(
-                params_dtype=params_dtype,
-                num_layers=num_layers,
-                kv_channels=kv_channels,
-                num_attention_heads=num_attention_heads,
-            ),
+            model_config=model_config,
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
                 num_cuda_graphs=num_cuda_graphs,
@@ -121,6 +124,58 @@ class TestDynamicContext:
             ),
         )
         return dynamic_context
+
+    @pytest.mark.internal
+    @rounder_override(1)
+    def test_attention_mtp_uses_stable_fixed_blocks(self):
+        """MTP cache blocks are separate and keyed by stable Mamba request slots."""
+        context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=64,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=64,
+            max_requests=2,
+            is_hybrid_model=True,
+            num_speculative_tokens=3,
+            hybrid_layer_pattern="M-*E/*E/*E",
+        )
+
+        assert context.mtp_attention_layer_map == {1: 0}
+        assert context.mtp_memory_buffer.shape[1] == 1
+        assert context.mtp_kv_block_count == 2 * context.max_kv_block_count + 1
+
+        context.begin_mtp_attention(
+            query_lengths=torch.tensor([3, 1], dtype=torch.int32),
+            kv_offsets=torch.tensor([0, 5], dtype=torch.int32),
+            request_slots=torch.tensor([1, -1], dtype=torch.int64),
+            token_cache_positions=torch.tensor([0, 1, 2, 5], dtype=torch.int64),
+            decode_only=False,
+        )
+        torch.cuda.synchronize()
+
+        first_slot_block = context.max_kv_block_count
+        torch.testing.assert_close(
+            context.gpu_view.token_to_block_idx[:4].cpu(),
+            torch.tensor(
+                [first_slot_block, first_slot_block, first_slot_block, context.mtp_dummy_block_idx]
+            ),
+        )
+        torch.testing.assert_close(
+            context.gpu_view.token_to_local_position_within_kv_block[:4].cpu(),
+            torch.tensor([0, 1, 2, 5], dtype=torch.int32),
+        )
+        mha_state = context.active_attn_metadata["mha_metadata"].state_data
+        torch.testing.assert_close(mha_state["query_lengths"].cpu(), torch.tensor([3, 1]))
+        torch.testing.assert_close(mha_state["kv_seq_lengths"].cpu(), torch.tensor([3, 6]))
+        assert context.is_decode_only() is False
+        assert context.using_cuda_graph_this_step() is False
+
+        context.end_mtp_attention()
+        assert context._mtp_attention_active is False
 
     @classmethod
     def teardown_class(cls):

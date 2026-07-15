@@ -394,6 +394,29 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"Using `DynamicInferenceContext` with no attention is not supported."
             )
 
+        # Attention-based MTP needs storage distinct from the target KV cache.
+        # MTP inner layers restart numbering at one, so sharing layer_map would
+        # alias a decoder layer. Fixed blocks are keyed by stable Mamba slots.
+        self.mtp_attention_layer_map = {}
+        hybrid_pattern = getattr(model_config, "hybrid_layer_pattern", None)
+        if self.num_speculative_tokens > 0 and hybrid_pattern and "/" in hybrid_pattern:
+            mtp_pattern = hybrid_pattern.split("/")[1]
+            attention_idx = 0
+            for layer_idx, symbol in enumerate(mtp_pattern, start=1):
+                if symbol == "*":
+                    self.mtp_attention_layer_map[layer_idx] = attention_idx
+                    attention_idx += 1
+        self.num_mtp_attention_layers = len(self.mtp_attention_layer_map)
+        self._mtp_attention_active = False
+        self._mtp_attention_decode_only = False
+        self._mtp_active_token_count = 0
+        self._mtp_padded_request_count = 0
+        if self.num_mtp_attention_layers > 0:
+            logging.info(
+                "Enabled a dedicated KV cache for %d attention-based MTP layer(s)",
+                self.num_mtp_attention_layers,
+            )
+
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
         self.block_size_tokens = inference_config.block_size_tokens
@@ -822,6 +845,39 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+
+        if self.num_mtp_attention_layers > 0:
+            # One fixed block range per stable request slot, plus a dummy block.
+            self.mtp_kv_block_count = self.max_requests * self.max_kv_block_count + 1
+            self.mtp_dummy_block_idx = self.mtp_kv_block_count - 1
+            self.mtp_memory_buffer = torch.empty(
+                (
+                    2,
+                    self.num_mtp_attention_layers,
+                    self.mtp_kv_block_count,
+                    self.block_size_tokens,
+                    self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            logging.info(
+                "Allocated %.2f GiB for repeated-MTP KV state (%d stable request slots)",
+                self.mtp_memory_buffer.numel() * self.mtp_memory_buffer.element_size() / 2**30,
+                self.max_requests,
+            )
+            if (
+                self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+                and not self._uses_torch_memory_saver
+            ):
+                self._offloadable_tensor_names.add("mtp_memory_buffer")
+                self._offloadable_cpu_backups["mtp_memory_buffer"] = torch.empty_like(
+                    self.mtp_memory_buffer, device="cpu"
+                ).pin_memory()
+        else:
+            self.mtp_memory_buffer = None
+
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -1442,17 +1498,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Return if this iteration we run decode only implementation.
 
+        MTP attention temporarily installs its own non-graph metadata.
+
         When CUDA graphs are active, uses padded_batch_dimensions because it
         reflects the post-expert-parallel sync state.  Otherwise falls back to
         num_prefill_requests which is always up-to-date regardless of where we
         are in the step lifecycle.
         """
+        if self._mtp_attention_active:
+            return self._mtp_attention_decode_only
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
+        if self._mtp_attention_active:
+            return False
         return self._using_cuda_graph_this_step
 
     def has_unfinished_requests(self) -> bool:
@@ -1545,6 +1607,123 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
         self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
+    def begin_mtp_attention(
+        self,
+        query_lengths: Tensor,
+        kv_offsets: Tensor,
+        request_slots: Tensor,
+        token_cache_positions: Tensor,
+        *,
+        decode_only: bool,
+    ) -> None:
+        """Install non-graph attention metadata for an MTP prefill or serial depth.
+
+        MTP blocks are fixed per stable Mamba slot. ``kv_offsets`` is the
+        verified MTP prefix length before this call, while
+        ``token_cache_positions`` gives the cache position of every packed query.
+        """
+        if self.mtp_memory_buffer is None:
+            raise RuntimeError("MTP attention cache requested for a model without MTP attention")
+        query_lengths = query_lengths.to(device="cpu", dtype=torch.int32)
+        kv_offsets = kv_offsets.to(device="cpu", dtype=torch.int32)
+        request_slots = request_slots.to(device="cpu", dtype=torch.int64)
+        token_cache_positions = token_cache_positions.to(device="cpu", dtype=torch.int64)
+        request_count = query_lengths.numel()
+        token_count = int(query_lengths.sum().item())
+        if kv_offsets.numel() != request_count or request_slots.numel() != request_count:
+            raise ValueError("MTP attention metadata tensors must have equal request counts")
+        if token_cache_positions.numel() != token_count:
+            raise ValueError("MTP cache positions must match the packed query-token count")
+        if request_count > self.max_requests or token_count > self.max_tokens:
+            raise ValueError("MTP attention batch exceeds the dynamic context capacity")
+        if request_count and (query_lengths <= 0).any():
+            raise ValueError("MTP attention query lengths must be positive")
+        real_slots = request_slots[request_slots >= 0]
+        if real_slots.numel() and (real_slots >= self.max_requests).any():
+            raise ValueError("MTP attention request slot exceeds max_requests")
+        token_slots = torch.repeat_interleave(request_slots, query_lengths.to(torch.int64))
+        real_positions = token_cache_positions[token_slots >= 0]
+        if real_positions.numel() and (
+            (real_positions < 0).any() or (real_positions >= self.max_sequence_length).any()
+        ):
+            raise ValueError("MTP cache position exceeds max_sequence_length")
+        if request_count and (
+            (kv_offsets < 0).any()
+            or (kv_offsets + query_lengths > self.max_sequence_length).any()
+        ):
+            raise ValueError("MTP KV sequence length exceeds max_sequence_length")
+
+        self._mtp_attention_active = True
+        self._mtp_attention_decode_only = decode_only
+        self._mtp_active_token_count = token_count
+        self._mtp_padded_request_count = request_count
+        self.active_attn_metadata = self.non_graph_attn_metadata
+
+        # Fixed block table: each stable slot owns max_kv_block_count blocks.
+        self._cpu_mha_block_table[:request_count].fill_(-1)
+        for row, slot in enumerate(request_slots.tolist()):
+            if slot < 0:
+                self._cpu_mha_block_table[row, 0] = self.mtp_dummy_block_idx
+            else:
+                first_block = slot * self.max_kv_block_count
+                self._cpu_mha_block_table[row] = torch.arange(
+                    first_block,
+                    first_block + self.max_kv_block_count,
+                    dtype=self._cpu_mha_block_table.dtype,
+                )
+        if request_count < self.max_requests:
+            self._cpu_mha_block_table[request_count:].fill_(-1)
+
+        self._cpu_mha_query_lengths[:request_count] = query_lengths
+        self._cpu_mha_kv_seq_lengths[:request_count] = kv_offsets + query_lengths
+        self._cpu_mha_cu_query_seq_lengths[0] = 0
+        self._cpu_mha_cu_kv_seq_lengths[0] = 0
+        if request_count:
+            self._cpu_mha_cu_query_seq_lengths[1 : request_count + 1] = torch.cumsum(
+                query_lengths, dim=0
+            )
+            self._cpu_mha_cu_kv_seq_lengths[1 : request_count + 1] = torch.cumsum(
+                self._cpu_mha_kv_seq_lengths[:request_count], dim=0
+            )
+        if request_count < self.max_requests:
+            self._cpu_mha_query_lengths[request_count:].zero_()
+            self._cpu_mha_kv_seq_lengths[request_count:].zero_()
+            self._cpu_mha_cu_query_seq_lengths[request_count + 1 :] = (
+                self._cpu_mha_cu_query_seq_lengths[request_count]
+            )
+            self._cpu_mha_cu_kv_seq_lengths[request_count + 1 :] = (
+                self._cpu_mha_cu_kv_seq_lengths[request_count]
+            )
+
+        real_tokens = token_slots >= 0
+        block_ids = torch.full((token_count,), self.mtp_dummy_block_idx, dtype=torch.int64)
+        if real_tokens.any():
+            block_ids[real_tokens] = (
+                token_slots[real_tokens] * self.max_kv_block_count
+                + token_cache_positions[real_tokens] // self.block_size_tokens
+            )
+        self.token_to_block_idx[:token_count] = block_ids
+        self.token_to_local_position_within_kv_block[:token_count] = (
+            token_cache_positions % self.block_size_tokens
+        ).to(torch.int32)
+
+        mha = self.active_attn_metadata["mha_metadata"]
+        max_q = int(query_lengths.max().item()) if request_count else 1
+        max_k = int((kv_offsets + query_lengths).max().item()) if request_count else 1
+        mha.set_state_data(
+            padded_active_request_count=request_count,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+        )
+        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+
+    def end_mtp_attention(self) -> None:
+        """Leave MTP metadata mode; the next target step rebuilds normal metadata."""
+        self._mtp_attention_active = False
+        self._mtp_attention_decode_only = False
+        self._mtp_active_token_count = 0
+        self._mtp_padded_request_count = 0
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
@@ -1553,6 +1732,35 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
+        if self._mtp_attention_active:
+            if layer_number not in self.mtp_attention_layer_map:
+                raise KeyError(f"MTP attention layer {layer_number} is not mapped")
+            attention_layer_number = self.mtp_attention_layer_map[layer_number]
+            if triton_append_key_value_cache is not None:
+                triton_append_key_value_cache(
+                    layer_number=attention_layer_number,
+                    key=key,
+                    value=value,
+                    memory_buffer=self.mtp_memory_buffer,
+                    padded_active_token_count=self._mtp_active_token_count,
+                    token_to_block_idx=self.gpu_view.token_to_block_idx,
+                    token_to_local_position_within_kv_block=(
+                        self.gpu_view.token_to_local_position_within_kv_block
+                    ),
+                )
+            else:
+                block_idx = self.gpu_view.token_to_block_idx[: self._mtp_active_token_count]
+                local_idx = self.gpu_view.token_to_local_position_within_kv_block[
+                    : self._mtp_active_token_count
+                ]
+                self.mtp_memory_buffer[0, attention_layer_number, block_idx, local_idx] = (
+                    key.squeeze(1)[: self._mtp_active_token_count]
+                )
+                self.mtp_memory_buffer[1, attention_layer_number, block_idx, local_idx] = (
+                    value.squeeze(1)[: self._mtp_active_token_count]
+                )
+            return
+
         attention_layer_number = self.layer_map[layer_number - 1]
 
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
@@ -1604,6 +1812,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor, Tensor]) The key and value pointer tensors that point
             to blocks within the block-level memory buffer as well as the block table.
         """
+        if self._mtp_attention_active:
+            if layer_number not in self.mtp_attention_layer_map:
+                raise KeyError(f"MTP attention layer {layer_number} is not mapped")
+            attention_layer_number = self.mtp_attention_layer_map[layer_number]
+            assert self.active_attn_metadata is not None
+            block_table = self.active_attn_metadata["mha_metadata"].state_data["block_table"]
+            return (
+                self.mtp_memory_buffer[0, attention_layer_number],
+                self.mtp_memory_buffer[1, attention_layer_number],
+                block_table,
+            )
+
         attention_layer_number = self.layer_map[layer_number - 1]
 
         assert self.active_attn_metadata is not None
@@ -1845,6 +2065,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         for attn_metadata in self.graph_attn_metadata.values():
             attn_metadata.reset()
         self.active_attn_metadata = None
+        self._mtp_attention_active = False
+        self._mtp_attention_decode_only = False
+        self._mtp_active_token_count = 0
+        self._mtp_padded_request_count = 0
 
         if self.is_hybrid_model:
             self.mamba_metadata.reset_varlen_metadata()

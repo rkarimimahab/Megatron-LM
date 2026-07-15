@@ -982,18 +982,43 @@ class TextGenerationController:
             if has_mtp:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
-                current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
-                    hidden_states=current_hidden,
-                    next_token_ids=token_ids_buf,
-                    position_ids=position_ids_buf,
-                    depth=mtp_depth,
-                    eager=not context.using_cuda_graph_this_step(),
-                    cache_key=(
-                        ("mtp", padded_count, mtp_depth)
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    ),
-                )
+                use_mtp_attention = context.num_mtp_attention_layers > 0
+                if use_mtp_attention:
+                    slots = context.mamba_metadata.request_to_mamba_state_idx[active_slice].clone()
+                    if pad_count:
+                        slots = F.pad(slots, (0, pad_count), value=-1)
+                    cache_offsets = torch.zeros(padded_count, dtype=torch.int32)
+                    cache_offsets[:active_request_count] = (
+                        base_position.to(device="cpu", dtype=torch.int32) - 1 + depth
+                    )
+                    context.begin_mtp_attention(
+                        query_lengths=torch.ones(padded_count, dtype=torch.int32),
+                        kv_offsets=cache_offsets,
+                        request_slots=slots,
+                        token_cache_positions=cache_offsets.to(torch.int64),
+                        decode_only=True,
+                    )
+                try:
+                    current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                        hidden_states=current_hidden,
+                        next_token_ids=token_ids_buf,
+                        position_ids=position_ids_buf,
+                        inference_context=context if use_mtp_attention else None,
+                        depth=mtp_depth,
+                        eager=True if use_mtp_attention else not context.using_cuda_graph_this_step(),
+                        cache_key=(
+                            None
+                            if use_mtp_attention
+                            else (
+                                ("mtp", padded_count, mtp_depth)
+                                if context.using_cuda_graph_this_step()
+                                else None
+                            )
+                        ),
+                    )
+                finally:
+                    if use_mtp_attention:
+                        context.end_mtp_attention()
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
                 # Strip padding from logits only. Hidden states stay padded+SP

@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -141,6 +142,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
+        # DynamicInferenceContext is constructed from ``model.config`` (the
+        # TransformerConfig), not the HybridModelConfig wrapper. Preserve the
+        # unified pattern there so inference can allocate a distinct cache for
+        # attention-based MTP layers.
+        self.config.hybrid_layer_pattern = self.hybrid_layer_pattern
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
@@ -412,6 +418,77 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
             self.cudagraph_manager = CudaGraphManager(config)
 
+    def _prefill_mtp_attention_cache(
+        self, input_ids, position_ids, hidden_states, inference_context
+    ) -> None:
+        """Populate repeated-MTP attention KV state for newly prefetched prompts.
+
+        For every prompt, cache the trained pairs ``(hidden_t, token_{t+1})``.
+        The final pair is deferred until the target samples the next token and is
+        appended by the serial MTP path. Chunked prefill is intentionally rejected
+        for now because it needs one pending boundary hidden state per request.
+        """
+        if (
+            not self.mtp_process
+            or inference_context.num_prefill_requests == 0
+            or inference_context.num_mtp_attention_layers == 0
+        ):
+            return
+        if self.config.sequence_parallel:
+            raise NotImplementedError("MTP attention cache prefill does not yet support SP")
+
+        decode_count = inference_context.num_decode_requests
+        active_start = inference_context.paused_request_count
+        prefill_start = active_start + decode_count
+        prefill_end = inference_context.total_request_count
+        query_lengths_all = inference_context.request_query_lengths[prefill_start:prefill_end]
+        kv_offsets_all = inference_context.request_kv_length_offsets[prefill_start:prefill_end]
+        if (kv_offsets_all != 0).any():
+            raise NotImplementedError(
+                "Attention-based MTP currently requires unchunked prompt prefill"
+            )
+
+        packed_start = decode_count * (inference_context.num_speculative_tokens + 1)
+        selected_indices = []
+        query_lengths = []
+        cache_positions = []
+        request_slots = []
+        cursor = packed_start
+        for request_idx, query_length in enumerate(query_lengths_all.tolist()):
+            cache_length = max(0, query_length - 1)
+            if cache_length:
+                selected_indices.extend(range(cursor, cursor + cache_length))
+                query_lengths.append(cache_length)
+                cache_positions.extend(range(cache_length))
+                slot = inference_context.mamba_metadata.request_to_mamba_state_idx[
+                    prefill_start + request_idx
+                ]
+                request_slots.append(int(slot.item()))
+            cursor += query_length
+        if not selected_indices:
+            return
+
+        device = hidden_states.device
+        selected = torch.tensor(selected_indices, dtype=torch.long, device=device)
+        next_selected = selected + 1
+        inference_context.begin_mtp_attention(
+            query_lengths=torch.tensor(query_lengths, dtype=torch.int32),
+            kv_offsets=torch.zeros(len(query_lengths), dtype=torch.int32),
+            request_slots=torch.tensor(request_slots, dtype=torch.int64),
+            token_cache_positions=torch.tensor(cache_positions, dtype=torch.int64),
+            decode_only=False,
+        )
+        try:
+            self.mtp.layers[0].prefill_attention_cache(
+                hidden_states=hidden_states[selected],
+                next_token_ids=input_ids[:, next_selected],
+                position_ids=position_ids[:, next_selected],
+                embedding=self.embedding,
+                inference_context=inference_context,
+            )
+        finally:
+            inference_context.end_mtp_attention()
+
     def forward(
         self,
         input_ids: Tensor,
@@ -534,6 +611,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
+
+        if is_spec_decode:
+            self._prefill_mtp_attention_cache(
+                input_ids, position_ids, hidden_states, inference_context
+            )
 
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
         if mtp_forward_ran:

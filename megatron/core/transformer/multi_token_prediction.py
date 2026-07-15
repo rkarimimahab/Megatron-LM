@@ -1236,6 +1236,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         next_token_ids: Tensor,
         position_ids: Tensor,
         embedding: Callable,
+        inference_context: Optional[InferenceParams] = None,
         attention_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
@@ -1272,8 +1273,52 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            inference_params=inference_context,
         )
         return hidden_states
+
+    def prefill_attention_cache(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        embedding: Callable,
+        inference_context: InferenceParams,
+    ) -> None:
+        """Populate KV state for a leading attention-only MTP sublayer.
+
+        The repeated Nano MTP pattern is ``*E``. KV entries are produced by
+        the leading attention layer; running the following expert layer would
+        discard its output and, under EP request routing, introduce an
+        unmatched all-to-all on ranks doing dummy forwards.
+        """
+        if not self.mtp_layer_pattern or self.mtp_layer_pattern[0] != "*":
+            raise NotImplementedError("MTP cache prefill requires a leading attention layer")
+        if self.mtp_layer_pattern.count("*") != 1:
+            raise NotImplementedError(
+                "MTP cache-only prefill currently supports one leading attention layer"
+            )
+
+        decoder_input = embedding(input_ids=next_token_ids, position_ids=position_ids)
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states, requires_grad=False, keep_graph=False
+        )
+        rng_context = (
+            tensor_parallel.get_cuda_rng_tracker().fork()
+            if self.config.sequence_parallel
+            else nullcontext()
+        )
+        fp8_context = get_fp8_context(self.config) if self.config.fp8 else nullcontext()
+        attention_fp8_context = get_fp8_context(self.config) if self.config.fp8 else nullcontext()
+        with rng_context:
+            with fp8_context:
+                hidden_states = self._concat_embeddings(hidden_states, decoder_input)
+            with attention_fp8_context:
+                hidden_states, _ = self.mtp_model_layer.layers[0](
+                    hidden_states=hidden_states,
+                    attention_mask=None,
+                    inference_context=inference_context,
+                )
 
     def _checkpointed_forward(
         self,

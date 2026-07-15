@@ -351,6 +351,7 @@ class LanguageModule(MegatronModule):
         hidden_states: Tensor,
         next_token_ids: Tensor,
         position_ids: Tensor,
+        inference_context=None,
         depth: Optional[int] = None,
         eager: bool = False,
         cache_key=None,
@@ -383,6 +384,7 @@ class LanguageModule(MegatronModule):
             next_token_ids=next_token_ids,
             position_ids=position_ids,
             embedding=self.embedding,
+            inference_context=inference_context,
         )
 
         output_weight = None
