@@ -9,16 +9,19 @@
 #     sbatch --gres=gpu:8 scripts/speed_bench/run_speed_bench.slurm
 #
 # SBATCH resource lines below are DEFAULTS; override on the command line, e.g.
-#   sbatch -A my_account -p batch -q normal --gres=gpu:8 scripts/speed_bench/run_speed_bench.slurm
+#   sbatch -A my_account -p interactive -q normal --gres=gpu:8 scripts/speed_bench/run_speed_bench.slurm
 # See scripts/speed_bench/README.md for the full knob list and troubleshooting.
 #SBATCH --job-name=speed_bench
-#SBATCH -p batch
+# Previous default partition:
+##SBATCH -p batch
+# Default all future SPEED-Bench submissions to the interactive partition.
+#SBATCH -p interactive
 #SBATCH -q normal
 #SBATCH -t 4:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 # NOTE: supply a SLURM account via `sbatch -A <account> ...` or the
-# SBATCH_ACCOUNT env var. Partition/QOS above (batch/normal) are examples --
+# SBATCH_ACCOUNT env var. Partition/QOS above (interactive/normal) are examples --
 # override with `-p`/`-q` for your cluster.
 
 set -uo pipefail
@@ -35,22 +38,36 @@ CONTAINER_MOUNTS="/lustre:/lustre${EXTRA_MOUNTS:+,${EXTRA_MOUNTS}}"
 WORKDIR="${PWD}"                                   # the Megatron-LM checkout root
 
 # --- Benchmark knobs (exported so srun propagates them to every rank) -------
-export SPEC_TOKENS=${SPEC_TOKENS:-2}
+export SPEC_TOKENS=${SPEC_TOKENS:-11}
 export CKPT=${CKPT:?set CKPT to your Megatron MTP checkpoint directory}
 export TOKENIZER=${TOKENIZER:-nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16}
-export TP=${TP:-2}
+# Previous Nemotron-3-Super inference defaults:
+# export TP=${TP:-2}
+# export EP=${EP:-8}
+# NanoV3 3B single-node inference defaults:
+export TP=${TP:-1}
 export EP=${EP:-8}
-export BUFFER_GB=${BUFFER_GB:-12}
-export MAX_REQUESTS=${MAX_REQUESTS:-32}
-export OSL=${OSL:-512}
-export CONCURRENCY=${CONCURRENCY:-8}
-export NUM_REQUESTS=${NUM_REQUESTS:-}              # cap for smoke tests (empty = full split)
+export CKPT_STEP=${CKPT_STEP:-4070}
+export BUFFER_GB=${BUFFER_GB:-6}
+export MAX_REQUESTS=${MAX_REQUESTS:-16}
+export OSL=${OSL:-1024}
+export CONCURRENCY=${CONCURRENCY:-16}
+export MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-16384}
+export NUM_REQUESTS=${NUM_REQUESTS:-}                # empty = full dataset; set only for smoke tests
 export SPEED_BENCH_CATEGORY=${SPEED_BENCH_CATEGORY:-}
 export SPECDEC_BENCH=${SPECDEC_BENCH:?set SPECDEC_BENCH to your specdec_bench checkout}
+export SPECDEC_RUNTIME_PARAMS=
 export SPEED_BENCH_DATA=${SPEED_BENCH_DATA:?set SPEED_BENCH_DATA to your staged SPEED-Bench parquet dir}
+export AA_DATA=${AA_DATA:-/lustre/fsw/portfolios/coreai/users/iputterman/aa_gen_16k_1k.jsonl}
 export SAVE_DIR=${SAVE_DIR:-}                      # defaults to <EXP_DIR>/ar_results
 # HF cache (where the tokenizer is / will be cached).
 export HF_HOME=${HF_HOME:-${HOME}/.cache/huggingface}
+
+EXPECTED_WORLD_SIZE=$(( TP * EP ))
+if [ "${NUM_GPUS}" -ne "${EXPECTED_WORLD_SIZE}" ]; then
+    echo "ERROR: TP=${TP} and EP=${EP} require ${EXPECTED_WORLD_SIZE} ranks, but allocation has ${NUM_GPUS}." >&2
+    exit 2
+fi
 
 # --- Experiment directory ---------------------------------------------------
 export EXP_NAME=${EXP_NAME:-speed_bench}
